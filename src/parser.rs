@@ -323,6 +323,45 @@ pub enum DataRecordType {
     Ipv6Addr,
 }
 
+#[repr(C)]
+#[derive(Debug, PartialEq, Clone)]
+struct U40Bytes([u8; 5]);
+
+impl BinWrite for U40Bytes {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        _: Endian,
+        _: Self::Args<'_>,
+    ) -> BinResult<()> {
+        let start_pos = writer.stream_position()?;
+        writer.write_all(&self.0)?;
+        let end_pos = writer.stream_position()?;
+        assert_eq!(
+            end_pos - start_pos,
+            5,
+            "U40Bytes wrote wrong number of bytes"
+        );
+        Ok(())
+    }
+}
+
+impl BinRead for U40Bytes {
+    type Args<'a> = ();
+
+    fn read_options<R: Read + Seek>(
+        reader: &mut R,
+        _: Endian,
+        _: Self::Args<'_>,
+    ) -> BinResult<Self> {
+        let mut bytes = [0u8; 5];
+        reader.read_exact(&mut bytes)?;
+        Ok(U40Bytes(bytes))
+    }
+}
+
 #[binwrite]
 #[bw(big)]
 #[bw(import( length: u16 ))]
@@ -331,6 +370,24 @@ pub enum DataRecordValue {
     U8(u8),
     U16(u16),
     U32(u32),
+    U40(
+        #[bw(try_map = |x: &u64| -> BinResult<U40Bytes> {
+        if *x > 0xFF_FFFF_FFFF {
+            return Err(binrw::Error::Custom {
+                pos: 0,
+                err: Box::new("Value too large for U40"),
+            });
+        }
+        Ok(U40Bytes([
+            ((*x >> 32) & 0xFF) as u8,
+            ((*x >> 24) & 0xFF) as u8,
+            ((*x >> 16) & 0xFF) as u8,
+            ((*x >> 8) & 0xFF) as u8,
+            (*x & 0xFF) as u8,
+        ]))
+    })]
+        u64,
+    ),
     U64(u64),
     I8(i8),
     I16(i16),
@@ -399,6 +456,7 @@ impl BinRead for DataRecordValue {
             (DataRecordType::UnsignedInt, 1) => DataRecordValue::U8(reader.read_type(endian)?),
             (DataRecordType::UnsignedInt, 2) => DataRecordValue::U16(reader.read_type(endian)?),
             (DataRecordType::UnsignedInt, 4) => DataRecordValue::U32(reader.read_type(endian)?),
+            (DataRecordType::UnsignedInt, 5) => DataRecordValue::U40(read_u40(reader)?),
             (DataRecordType::UnsignedInt, 8) => DataRecordValue::U64(reader.read_type(endian)?),
             (DataRecordType::SignedInt, 1) => DataRecordValue::I8(reader.read_type(endian)?),
             (DataRecordType::SignedInt, 2) => DataRecordValue::I16(reader.read_type(endian)?),
@@ -453,5 +511,129 @@ impl BinRead for DataRecordValue {
             _ => Err(IpfixError::InvalidFieldSpecLength { ty, length }
                 .into_binrw_error(reader.stream_position()?))?,
         })
+    }
+}
+
+fn read_u40<R: Read + Seek>(reader: &mut R) -> BinResult<u64> {
+    let mut buf = [0u8; 5];
+    reader.read_exact(&mut buf)?;
+
+    // Convert 5 bytes to u64, maintaining network byte order (big-endian)
+    let value = ((buf[0] as u64) << 32)
+        | ((buf[1] as u64) << 24)
+        | ((buf[2] as u64) << 16)
+        | ((buf[3] as u64) << 8)
+        | (buf[4] as u64);
+
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binrw::BinRead;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_u40_edge_cases() {
+        // Test zero
+        let zero_value = DataRecordValue::U40(0);
+        let mut writer = Cursor::new(Vec::new());
+        zero_value
+            .write_options(&mut writer, Endian::Big, (5,))
+            .expect("Failed to write zero U40 value");
+        let written_bytes = writer.into_inner();
+        assert_eq!(written_bytes, [0, 0, 0, 0, 0]);
+
+        // Test one
+        let one_value = DataRecordValue::U40(1);
+        let mut writer = Cursor::new(Vec::new());
+        one_value
+            .write_options(&mut writer, Endian::Big, (5,))
+            .expect("Failed to write U40 value of 1");
+        let written_bytes = writer.into_inner();
+        assert_eq!(written_bytes, [0, 0, 0, 0, 1]);
+
+        // Test max valid value (40 bits = 0xFFFFFFFFFF)
+        let max_value = DataRecordValue::U40(0xFF_FFFF_FFFF);
+        let mut writer = Cursor::new(Vec::new());
+        max_value
+            .write_options(&mut writer, Endian::Big, (5,))
+            .expect("Failed to write max U40 value");
+        let written_bytes = writer.into_inner();
+        assert_eq!(written_bytes, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_u40_invalid_values() {
+        // Test value that's too large (41 bits set)
+        let too_large = DataRecordValue::U40(0x1FF_FFFF_FFFF);
+        let mut writer = Cursor::new(Vec::new());
+        let result = too_large.write_options(&mut writer, Endian::Big, (5,));
+        assert!(
+            result.is_err(),
+            "Should fail to write value larger than 40 bits"
+        );
+
+        // Test value at exactly 41 bits
+        let barely_too_large = DataRecordValue::U40(0x100_0000_0000);
+        let mut writer = Cursor::new(Vec::new());
+        let result = barely_too_large.write_options(&mut writer, Endian::Big, (5,));
+        assert!(result.is_err(), "Should fail to write value at 41 bits");
+    }
+
+    #[test]
+    fn test_u40_read_invalid() {
+        // Test reading truncated data (only 4 bytes)
+        let truncated_data = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        let mut reader = Cursor::new(truncated_data);
+        let result = DataRecordValue::read_options(
+            &mut reader,
+            Endian::Big,
+            (DataRecordType::UnsignedInt, 5), // Specifically asking for 5 bytes
+        );
+        assert!(result.is_err(), "Should fail to read truncated data");
+    }
+
+    #[test]
+    fn test_u40_roundtrip() {
+        let test_values = vec![
+            0u64,
+            1u64,
+            0xFF_FFFF_FFFFu64,   // max value
+            0x11_2233_4455u64,   // typical value
+            0x000F_FFFF_FFFFu64, // high bits not set
+            0x00F0_0000_0000u64, // high bits set but still within 40 bits
+        ];
+
+        for value in test_values {
+            let original = DataRecordValue::U40(value);
+
+            let mut writer = Cursor::new(Vec::new());
+            original
+                .write_options(&mut writer, Endian::Big, (5,))
+                .expect(&format!("Failed to write U40 value {:#X}", value));
+
+            // Verify we wrote exactly 5 bytes
+            let written_bytes = writer.into_inner();
+            assert_eq!(written_bytes.len(), 5, "Should write exactly 5 bytes");
+
+            let mut reader = Cursor::new(written_bytes);
+            let read_value = DataRecordValue::read_options(
+                &mut reader,
+                Endian::Big,
+                (DataRecordType::UnsignedInt, 5),
+            )
+            .expect(&format!("Failed to read U40 value {:#X}", value));
+
+            assert_eq!(
+                read_value, original,
+                "Roundtrip failed for value {:#X}",
+                value
+            );
+
+            // Verify we read exactly 5 bytes
+            assert_eq!(reader.position(), 5, "Should read exactly 5 bytes");
+        }
     }
 }
