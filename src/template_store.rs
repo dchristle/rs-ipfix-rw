@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExpandedFieldSpecifier {
     pub name: DataRecordKey,
     pub ty: DataRecordType,
@@ -48,7 +48,7 @@ impl ExpandedFieldSpecifier {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Template {
     Template(Vec<ExpandedFieldSpecifier>),
     OptionsTemplate(Vec<ExpandedFieldSpecifier>),
