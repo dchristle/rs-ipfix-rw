@@ -306,7 +306,7 @@ pub enum DataRecordKey {
     Err(String),
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub enum DataRecordType {
     UnsignedInt,
     SignedInt,
